@@ -760,6 +760,10 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
         available = tcp_sndbuf(socket->pcb.tcp);
     }
 
+    // One clock for the whole send: the tcp_sndbuf wait and the ERR_MEM loop can both
+    // run in one call, and the socket's timeout bounds their sum.
+    mp_uint_t start = mp_hal_ticks_ms();
+
     if (available == 0) {
         // Non-blocking socket
         if (socket->timeout == 0) {
@@ -768,7 +772,6 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
             return MP_STREAM_ERROR;
         }
 
-        mp_uint_t start = mp_hal_ticks_ms();
         // Assume that STATE_PEER_CLOSED may mean half-closed connection, where peer closed it
         // sending direction, but not receiving. Consequently, check for both STATE_CONNECTED
         // and STATE_PEER_CLOSED as normal conditions and still waiting for buffers to be sent.
@@ -793,11 +796,11 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
     u16_t write_len = MIN(available, len);
 
     // If tcp_write returns ERR_MEM then there's currently not enough memory to
-    // queue the write, so poll and keep trying until it succeeds (with 10s limit).
+    // queue the write, so poll and keep trying until it succeeds, the socket's
+    // timeout passes (ETIMEDOUT), or 10s pass on a socket with no timeout.
     // tcp_write queues nothing on ERR_MEM, so a non-blocking socket gets EAGAIN
     // instead and loses no data.
     err_t err;
-    mp_uint_t write_start = mp_hal_ticks_ms();
     for (;;) {
         err = tcp_write(socket->pcb.tcp, buf, write_len, TCP_WRITE_FLAG_COPY);
         if (err != ERR_MEM) {
@@ -807,12 +810,16 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
         if (err != ERR_OK) {
             break;
         }
-        if (mp_hal_ticks_ms() - write_start > 10000U) {
+        if (socket->timeout == -1 && mp_hal_ticks_ms() - start > 10000U) {
             break;
         }
         MICROPY_PY_LWIP_EXIT
         if (socket->timeout == 0) {
             *_errno = MP_EAGAIN;
+            return MP_STREAM_ERROR;
+        }
+        if (socket_is_timedout(socket, start)) {
+            *_errno = MP_ETIMEDOUT;
             return MP_STREAM_ERROR;
         }
         poll_sockets();
