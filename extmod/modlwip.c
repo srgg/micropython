@@ -794,9 +794,8 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
 
     // If tcp_write returns ERR_MEM then there's currently not enough memory to
     // queue the write, so poll and keep trying until it succeeds (with 10s limit).
-    // Note: if the socket is non-blocking then this code will actually block until
-    // there's enough memory to do the write, but by this stage we have already
-    // committed to being able to write the data.
+    // tcp_write queues nothing on ERR_MEM, so a non-blocking socket gets EAGAIN
+    // instead and loses no data.
     err_t err;
     mp_uint_t write_start = mp_hal_ticks_ms();
     for (;;) {
@@ -812,6 +811,10 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
             break;
         }
         MICROPY_PY_LWIP_EXIT
+        if (socket->timeout == 0) {
+            *_errno = MP_EAGAIN;
+            return MP_STREAM_ERROR;
+        }
         poll_sockets();
         MICROPY_PY_LWIP_REENTER
     }
