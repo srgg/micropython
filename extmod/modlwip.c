@@ -348,6 +348,9 @@ typedef struct _lwip_socket_obj_t {
 
     uint8_t domain;
     uint8_t type;
+    // Set by a non-blocking send on ERR_MEM; POLLOUT then needs one segment's memory to be
+    // allocatable, not a positive tcp_sndbuf.
+    uint8_t check_writespace;
 
     #define STATE_NEW 0
     #define STATE_LISTENING 1
@@ -367,6 +370,34 @@ static inline bool socket_is_timedout(lwip_socket_obj_t *socket, mp_uint_t ticks
 static inline void poll_sockets(void) {
     MICROPY_PY_LWIP_POLL_HOOK
     mp_event_wait_ms(1);
+}
+
+// After ERR_MEM, tcp_sndbuf is no proof a segment fits: the heap and the MEMP_TCP_SEG pool
+// are shared by every socket. One segment costs a pbuf of mss bytes, one tcp_seg and a free
+// slot in snd_queuelen; both allocations are tried and released, so a true answer means the
+// next tcp_write of one mss succeeds unless another socket takes the memory first.
+static bool lwip_tcp_segment_fits(struct tcp_pcb *pcb) {
+    if (tcp_sndqueuelen(pcb) >= TCP_SND_QUEUELEN) {
+        return false;
+    }
+    u16_t len = pcb->mss;
+    #if LWIP_VERSION_MAJOR < 2
+    // ESP8266's memp_malloc expands to SDK heap calls the port does not declare, and takes
+    // tcp_seg from the heap PBUF_RAM uses: the pbuf trial carries the tcp_seg's size.
+    len += sizeof(struct tcp_seg);
+    #else
+    struct tcp_seg *seg = (struct tcp_seg *)memp_malloc(MEMP_TCP_SEG);
+    if (seg == NULL) {
+        return false;
+    }
+    memp_free(MEMP_TCP_SEG, seg);
+    #endif
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
+    if (p == NULL) {
+        return false;
+    }
+    pbuf_free(p);
+    return true;
 }
 
 static struct tcp_pcb *volatile *lwip_socket_incoming_array(lwip_socket_obj_t *socket) {
@@ -813,8 +844,16 @@ static mp_uint_t lwip_tcp_send(lwip_socket_obj_t *socket, const byte *buf, mp_ui
         if (socket->timeout == -1 && mp_hal_ticks_ms() - start > 10000U) {
             break;
         }
+        if (socket->timeout == 0 && write_len > socket->pcb.tcp->mss) {
+            // tcp_write queues all of write_len or nothing, and under memory pressure one
+            // segment fits where several do not: one retry at a single mss before EAGAIN.
+            // mss is read before MICROPY_PY_LWIP_EXIT: after it _lwip_tcp_error may clear pcb.tcp.
+            write_len = socket->pcb.tcp->mss;
+            continue;
+        }
         MICROPY_PY_LWIP_EXIT
         if (socket->timeout == 0) {
+            socket->check_writespace = 1;
             *_errno = MP_EAGAIN;
             return MP_STREAM_ERROR;
         }
@@ -961,6 +1000,7 @@ static mp_obj_t lwip_socket_make_new(const mp_obj_type_t *type, size_t n_args, s
     socket->pcb.tcp = NULL;
     socket->incoming.udp_raw.array = NULL;
     socket->timeout = -1;
+    socket->check_writespace = 0;
     socket->recv_offset = 0;
     socket->domain = MOD_NETWORK_AF_INET;
     socket->type = MOD_NETWORK_SOCK_STREAM;
@@ -1185,6 +1225,7 @@ static mp_obj_t lwip_socket_accept(mp_obj_t self_in) {
     socket2->type = MOD_NETWORK_SOCK_STREAM;
     socket2->incoming.tcp.pbuf = NULL;
     socket2->timeout = socket->timeout;
+    socket2->check_writespace = 0;
     socket2->state = STATE_CONNECTED;
     socket2->recv_offset = 0;
     socket2->callback = MP_OBJ_NULL;
@@ -1653,7 +1694,10 @@ static mp_uint_t lwip_socket_ioctl(mp_obj_t self_in, mp_uint_t request, uintptr_
             } else if (socket->state != STATE_CONNECTING && socket->pcb.tcp != NULL && tcp_sndbuf(socket->pcb.tcp) > 0) {
                 // TCP socket is writable
                 // Note: pcb.tcp==NULL if state<0, and in this case we can't call tcp_sndbuf
-                ret |= MP_STREAM_POLL_WR;
+                if (!socket->check_writespace || lwip_tcp_segment_fits(socket->pcb.tcp)) {
+                    socket->check_writespace = 0;
+                    ret |= MP_STREAM_POLL_WR;
+                }
             }
         }
 
